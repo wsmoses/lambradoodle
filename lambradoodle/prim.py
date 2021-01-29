@@ -10,7 +10,7 @@ import zipfile
 FUNCTION_NAME = "kevin"
 runtime = "python3.7"
 memory=1500
-timeout=60*3
+timeout=60*10
 LAMBDA_ROLE='arn:aws:iam::145258838769:role/EigensheepLambdaRole'
 
 LAMBDA_TEMPLATE_PYTHON = open(
@@ -75,19 +75,48 @@ def pencode(data):
     return base64.b64encode(zlib.compress(pickle.dumps(data, 2))).decode("utf-8")
 
 class LambdaCaller():
-    def __init__(self, lambdaClient, fn, ver):
+    def __init__(self, lambdaClient, fn, ver, ignore_errors):
         self.lambdaClient = lambdaClient
         self.fn = fn
         self.ver = ver
+        self.ignore_errors = ignore_errors
 
     def __call__(self, val):
         import dill
-        r = self.lambdaClient.invoke(
-            FunctionName=self.fn,
-            InvocationType="RequestResponse",
-            Payload=json.dumps({'data':pencode(val)}).encode("utf-8"),
-            Qualifier=self.ver
-        )
+        from time import sleep
+        numsleep = .1
+        import botocore
+        import botocore.errorfactory
+        while True:
+            try:
+                r = self.lambdaClient.invoke(
+                    FunctionName=self.fn,
+                    InvocationType="RequestResponse",
+                    Payload=json.dumps({'data':pencode(val)}).encode("utf-8"),
+                    Qualifier=self.ver
+                )
+                break
+            
+            except botocore.exceptions.ClientError as err:
+                response = err.response
+                if (response and response.get("Error", {}).get("Code") ==
+                        "TooManyRequestsException"):
+                    sleep(numsleep)
+                    numsleep *= 2
+                    continue
+                if not self.ignore_errors:
+                    raise(err)
+                else:
+                    print(err)
+                    return None
+            except Exception as e:
+                if not self.ignore_errors:
+                    raise(e)
+                else:
+                    print(e)
+                    return None
+
+
         read = r['Payload'].read()
         em = '{"errorMessage": '
         if len(read) > len(em) and read[:len(em)].decode("utf-8") == em:
@@ -101,7 +130,12 @@ class LambdaCaller():
 class LambdaExecutor():
     def __init__(self):   
         session = boto3.session.Session()
-        self.lambdaClient = session.client("lambda")
+        import botocore
+        config = botocore.config.Config(
+            read_timeout=timeout,
+            connect_timeout=timeout,
+        )
+        self.lambdaClient = session.client("lambda", config=config)
         self.s3 = session.client("s3")
         self.layerCache = {}
         
@@ -154,7 +188,7 @@ class LambdaExecutor():
         fn, ver = pay.split('\n')
         return LambdaCaller(self.lambdaClient, fn, ver)
 
-    def makeMapper2(self, fn, packages=[], modules=[]):
+    def makeMapper2(self, fn, packages=[], modules=[], ignore_errors=False):
         packages = list(packages)
         if 'dill' not in packages:
             packages.append('dill')
@@ -219,6 +253,7 @@ class LambdaExecutor():
 
         zipf.close()
         zipfile = pseudofile.getvalue()
+        print(len(zipfile))
         FUNCTION_NAME = "kevin2_" + layerhash
         try:
             res = self.lambdaClient.create_function(
@@ -241,7 +276,7 @@ class LambdaExecutor():
                         ZipFile=zipfile,
                         Publish=True
                     )
-        return LambdaCaller(self.lambdaClient, FUNCTION_NAME, res['Version'])
+        return LambdaCaller(self.lambdaClient, FUNCTION_NAME, res['Version'], ignore_errors)
 
 if __name__ == '__main__':
     from concurrent.futures import ThreadPoolExecutor
